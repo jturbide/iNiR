@@ -9,6 +9,7 @@ import argparse
 import configparser
 import os
 from pathlib import Path
+import re
 import stat
 import tempfile
 
@@ -85,26 +86,76 @@ def qsettings_string(value):
     return ('"' + "".join(escaped) + '"').encode("ascii")
 
 
+def qt5_value(value):
+    # Qt6 writes UTF-8; retain existing escapes and typed-value syntax for Qt5.
+    def escape(match):
+        encoded = match[0].encode("utf-16-be")
+        return "".join(f"\\x{int.from_bytes(encoded[index:index + 2], 'big'):04x}"
+                       for index in range(0, len(encoded), 2))
+
+    return re.sub(r"[^\x00-\x7f]+[0-9a-fA-F]*", escape,
+                  value.decode("utf-8", errors="replace")).encode("ascii")
+
+
+def ini_records(contents):
+    start = index = 0
+    equals = comment = None
+    quoted = False
+    while index < len(contents):
+        character = contents[index]
+        if comment is None:
+            if character == 92:
+                index += 1
+                if (index + 1 < len(contents)
+                        and contents[index:index + 2] in (b"\r\n", b"\n\r")):
+                    index += 1
+                index += 1
+                continue
+            if character == 34:
+                quoted = not quoted
+            elif not quoted:
+                if character == 59:
+                    comment = index
+                elif character == 61 and equals is None:
+                    equals = index
+        if character in (10, 13) and (comment is not None or not quoted):
+            end = index + (2 if contents[index:index + 2] in (b"\r\n", b"\n\r") else 1)
+            yield contents[start:end], None if equals is None else equals - start, (comment if comment is not None else index) - start
+            start = index = end
+            equals = comment = None
+            quoted = False
+        else:
+            index += 1
+    if start < len(contents):
+        yield contents[start:], None if equals is None else equals - start, (comment if comment is not None else len(contents)) - start
+
+
+def ini_key(value):
+    return re.sub(rb"%(?:U([0-9a-fA-F]{4})|([0-9a-fA-F]{2}))",
+                  lambda match: chr(int(match[1] or match[2], 16)).encode("utf-8", errors="surrogatepass"), value.strip())
+
+
 def appearance_entries(contents):
     # Qt's typed values and escapes are not ConfigParser's INI dialect.
     # Only the owned Appearance assignments may be rewritten.
-    lines = contents.splitlines(keepends=True)
+    lines = []
     appearance = False
     insertion = None
     assignments = {}
-    for index, line in enumerate(lines):
-        stripped = line.strip()
+    for index, (line, equals, end) in enumerate(ini_records(contents)):
+        lines.append(line)
+        stripped = line[:end].strip()
         if index == 0:
             stripped = stripped.removeprefix(b"\xef\xbb\xbf")
         if stripped.startswith(b"[") and b"]" in stripped:
             if appearance:
                 insertion = index
-            appearance = stripped[1:].partition(b"]")[0] == b"Appearance"
+            appearance = ini_key(stripped[1:].partition(b"]")[0]) == b"Appearance"
             if appearance:
                 insertion = index + 1
-        elif appearance and b"=" in line:
-            key = line.partition(b"=")[0].strip()
-            assignments.setdefault(key, []).append(index)
+        elif appearance and equals is not None:
+            key = ini_key(line[:equals])
+            assignments.setdefault(key, []).append((index, equals + 1, end))
     if appearance:
         insertion = len(lines)
     return lines, assignments, insertion
@@ -112,8 +163,10 @@ def appearance_entries(contents):
 
 def appearance_value(contents, key):
     lines, assignments, _ = appearance_entries(contents)
-    indices = assignments.get(key, [])
-    return lines[indices[-1]].partition(b"=")[2].strip() if indices else b""
+    if key not in assignments:
+        return b""
+    index, start, end = assignments[key][-1]
+    return lines[index][start:end].strip()
 
 
 def is_empty(value):
@@ -122,22 +175,20 @@ def is_empty(value):
 
 def update_appearance(contents, values):
     lines, assignments, insertion = appearance_entries(contents)
-    newline = b"\r\n" if any(line.endswith(b"\r\n") for line in lines) else b"\n"
+    ending = re.search(rb"\r\n|\n\r|\r|\n", contents)
+    newline = ending[0] if ending else b"\n"
 
     values = dict(values)
-    styles = assignments.get(b"style", [])
-    style = lines[styles[-1]].partition(b"=")[2].strip() if styles else b""
-    if is_empty(style):
+    if is_empty(appearance_value(contents, b"style")):
         values[b"style"] = b"Darkly"
 
     missing = []
     for key, value in values.items():
         if key not in assignments:
             missing.append(key + b"=" + value + newline)
-        for index in assignments.get(key, []):
+        for index, start, end in assignments.get(key, []):
             line = lines[index]
-            ending = b"\r\n" if line.endswith(b"\r\n") else b"\n" if line.endswith(b"\n") else b""
-            lines[index] = line.partition(b"=")[0] + b"=" + value + ending
+            lines[index] = line[:start] + value + line[end:]
 
     if missing:
         if insertion is None:
@@ -153,7 +204,7 @@ def write_if_changed(path, contents):
     # Preserve an existing configuration-file symlink and its target's mode.
     path = path.resolve()
     if path.is_file() and path.read_bytes() == contents:
-        return
+        return False
     path.parent.mkdir(parents=True, exist_ok=True)
     mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o644
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -166,6 +217,7 @@ def write_if_changed(path, contents):
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+    return True
 
 
 def main():
@@ -197,12 +249,18 @@ def main():
         if args.icon_theme:
             appearance[b"icon_theme"] = qsettings_string(args.icon_theme)
         elif is_empty(appearance_value(config, b"icon_theme")):
-            appearance[b"icon_theme"] = qt6_icon if not is_empty(qt6_icon) else qsettings_string(args.fallback_icon_theme)
+            appearance[b"icon_theme"] = qt5_value(qt6_icon) if not is_empty(qt6_icon) else qsettings_string(args.fallback_icon_theme)
         updates.append((target, update_appearance(config, appearance)))
 
-    write_if_changed(output, contents.encode("utf-8"))
+    palette_changed = write_if_changed(output, contents.encode("utf-8"))
+    notifications = set()
     for target, contents in updates:
-        write_if_changed(target, contents)
+        config_changed = write_if_changed(target, contents)
+        if palette_changed or config_changed:
+            notifications.add(target.parent)
+    # qtct watches its config directory, including when the file is a symlink.
+    for directory in notifications:
+        os.utime(directory, None)
 
 
 if __name__ == "__main__":

@@ -71,6 +71,52 @@ def snapshot(paths):
     return [(path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ino) for path in paths]
 
 
+def check_qsettings_syntax(root):
+    home = root / "qsettings-syntax"
+    home.mkdir()
+    source = home / "source.colors"
+    source.write_text(source_text())
+    for ending in (b"\n", b"\r\n", b"\r", b"\n\r"):
+        opaque = (b'[Interface]\ntext="first\n[Appearance]\nstyle=inside a string\nlast"\n'
+                  b'[ %41ppearance ]\n%73tyle=Fusion\n%U0073tyle=Fusion\n'
+                  b'%u0073tyle=unrelated\n%UD83D%UDE00=emoji key\n'
+                  b'continued=one\\\nicon_theme=two\n'
+                  b'quoted="first\ncustom_palette=false\nlast"\n').replace(b"\n", ending)
+        for version in (5, 6):
+            path = config_path(home, version)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(opaque + b'color_scheme_path=old\\' + ending + b'path' + ending
+                             + b'custom_palette=false ; keep comment' + ending)
+        run(home, source, "--icon-theme", "NewIcon")
+        for version in (5, 6):
+            result = config_path(home, version).read_bytes()
+            assert result.startswith(opaque), "logical values and escaped Appearance keys must survive"
+            assert b'icon_theme="NewIcon"' + ending in result, "a continuation is not an icon assignment"
+            assert b'custom_palette=true; keep comment' + ending in result
+            assert b'old\\' not in result and b'path' + ending not in result, "replace the entire continued path"
+            assert b'Darkly' not in result, "preserve a style in an escaped or whitespace-padded section"
+        paths = [config_path(home, version) for version in (5, 6)]
+        before = snapshot(paths)
+        run(home, source, "--icon-theme", "NewIcon")
+        assert snapshot(paths) == before, "logical-line updates must be idempotent"
+
+    for version in (5, 6):
+        config_path(home, version).write_bytes(b'[Appearance]\nstyle="" ; style comment\nicon_theme= ; icon comment\n')
+    run(home, source, "--fallback-icon-theme", "fallback")
+    for version in (5, 6):
+        result = config_path(home, version).read_bytes()
+        assert b'style=Darkly; style comment\n' in result
+        assert b'icon_theme="fallback"; icon comment\n' in result
+
+    raw_icon = '"@@theme éa😀,semi;hash#quote\\"slash\\\\tail"'.encode("utf-8")
+    config_path(home, 5).write_bytes(b'[Appearance]\n')
+    config_path(home, 6).write_bytes(b'[Appearance]\nicon_theme=' + raw_icon + b'\n')
+    run(home, source)
+    expected = raw_icon.replace('éa😀'.encode("utf-8"), br'\x00e9\x0061\xd83d\xde00')
+    assert b'icon_theme=' + expected + b'\n' in config_path(home, 5).read_bytes(), "Qt5 needs escaped UTF-16 when inheriting a Qt6 UTF-8 icon"
+    assert b'icon_theme=' + raw_icon + b'\n' in config_path(home, 6).read_bytes(), "preserve Qt6's existing icon bytes"
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="inir-qtct-test-") as temporary:
         root = Path(temporary)
@@ -110,13 +156,20 @@ def main():
 
             outputs = [home / "data/color-schemes/iNiR-qtct.conf", config_path(home, 5), config_path(home, 6)]
             before = snapshot(outputs)
+            directories = [config_path(home, version).parent for version in (5, 6)]
+            directory_times = [directory.stat().st_mtime_ns for directory in directories]
             run(home, source)
             assert snapshot(outputs) == before, "an unchanged palette must not rewrite files or reset icons"
+            assert [directory.stat().st_mtime_ns for directory in directories] == directory_times, "unchanged inputs must not notify Qt applications"
             for invalid in (source_text(light).replace("[Colors:Window]", "[Missing:Window]"),
                             source_text(light).replace("ForegroundActive=71,174,199", "ForegroundActive=999,174,199")):
                 source.write_text(invalid)
                 run(home, source, success=False)
                 assert snapshot(outputs) == before, "invalid sources must not partly update settings"
+            source.write_text(source_text(not light))
+            run(home, source)
+            assert snapshot(outputs[1:]) == before[1:], "a palette-only change must preserve configuration files"
+            assert all(directory.stat().st_mtime_ns != timestamp for directory, timestamp in zip(directories, directory_times)), "palette changes must notify both qtct directories, including file symlinks"
 
         home = root / "new-config"
         home.mkdir()
@@ -145,6 +198,7 @@ def main():
         config_path(home, 6).write_text("[Appearance]\n" + encoded_icon)
         run(home, source)
         assert all(encoded_icon in config_path(home, version).read_text() for version in (5, 6)), "Qt5 must inherit Qt6's encoded icon without re-encoding it"
+        check_qsettings_syntax(root)
     print("qtct palette: dark/light roles, inactive fallback, settings preservation, idempotence and invalid-input safety pass")
     return 0
 
